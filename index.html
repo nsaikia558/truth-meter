@@ -10,17 +10,16 @@
   <header class="top">
     <button class="brand" data-go="home" aria-label="Home"><span class="dot"></span>Truth Meter <small>prototype</small></button>
   </header>
-
   <div id="sim-banner" class="sim-banner" hidden>SIMULATION MODE: no camera or mic, sensor data is made up. <a href="./">Switch to real sensors</a></div>
+
   <main>
     <!-- HOME -->
     <section id="home" class="screen">
-      <h1>Camera + mic stress test</h1>
-      <p class="lead">Answers a list of questions while the camera and microphone track heart rate, eyes, face tension and voice timing. Your truthful <b>baseline</b> answers set your normal level. Each <b>test</b> answer is marked <b>Truth</b> if it stays below that level and <b>Lie</b> if it rises above it, with a confidence score.</p>
+      <h1>Camera stress test</h1>
+      <p class="lead">First the person answers some <b>practice questions</b>: some truthfully, some with a lie on purpose. That teaches the app how <i>this</i> person looks when telling the truth and when lying. Then each <b>test question</b> is compared with both.</p>
       <div class="warn">
-        <b>Experimental, not a real lie detector.</b> It measures stress and effort, which nerves, lighting and movement also change. Use it only with people who agree to it, and never to make real decisions about anyone.
+        <b>Experimental, not a real lie detector.</b> It mostly measures how fast and how tense someone answers. Nerves, lighting and movement change that too. Use it only with people who agree to it, and never to make real decisions about anyone.
       </div>
-      <p class="muted" id="home-count"></p>
       <div class="row">
         <button class="btn primary" data-go="questions">Start: set up the questions</button>
         <button class="btn ghost" id="btn-last" hidden>Last results</button>
@@ -28,11 +27,16 @@
       <p class="muted small">Video and audio are processed in this browser only. Nothing is recorded or uploaded.</p>
     </section>
 
-    <!-- QUESTIONS -->
+    <!-- QUESTIONS (admin) -->
     <section id="questions" class="screen" hidden>
       <p class="step">Step 1 of 3 · Admin</p>
       <h1>Set the questions</h1>
-      <p class="muted">The admin sets the questions <b>before</b> the person sits down. They run in this order. <b>Baseline</b> questions must be answered truthfully (they teach the app the person's normal level, at least 3 needed). Mixing them in between test questions works best.</p>
+      <p class="muted">Set these <b>before</b> the person sits down. Use yes/no questions.</p>
+      <ul class="legend">
+        <li><span class="badge truth">truth</span> Practice: the person answers truthfully (at least 3)</li>
+        <li><span class="badge lie">lie</span> Practice: the person gives the <b>wrong</b> answer on purpose (at least 2)</li>
+        <li><span class="badge test">test</span> The questions you actually want checked</li>
+      </ul>
       <p class="counts" id="q-counts"></p>
       <ol id="qlist" class="qlist"></ol>
 
@@ -42,11 +46,26 @@
         <div class="row">
           <select id="qtype" aria-label="Question type">
             <option value="test">Test question</option>
-            <option value="baseline">Baseline (answer truthfully)</option>
+            <option value="truth">Practice: tell the truth</option>
+            <option value="lie">Practice: lie on purpose</option>
           </select>
           <button class="btn primary" type="submit">Add question</button>
         </div>
       </form>
+
+      <div class="card">
+        <h2>How many rounds?</h2>
+        <p class="muted small">Every question is asked once per round, in a new random order. More rounds = steadier results.</p>
+        <div class="row">
+          <select id="rounds" aria-label="Rounds">
+            <option value="2">2 rounds</option>
+            <option value="3">3 rounds (recommended)</option>
+            <option value="4">4 rounds</option>
+            <option value="5">5 rounds</option>
+          </select>
+          <span class="muted" id="duration"></span>
+        </div>
+      </div>
 
       <div class="row">
         <button class="btn" id="q-export">Export list</button>
@@ -66,18 +85,25 @@
     <section id="setup" class="screen" hidden>
       <p class="step">Step 2 of 3 · Person being tested</p>
       <h1>Sensor check</h1>
-      <p class="muted">Sit still, face the camera, light in front of you (not behind). Stay quiet for a moment while the mic measures room noise.</p>
+      <p class="muted">Prop the phone up (don't hold it), face a light, and stay quiet for a moment while the mic measures room noise.</p>
       <div class="sensor-slot"></div>
       <ul class="checks">
         <li id="ck-cam"><span></span>Camera</li>
         <li id="ck-face"><span></span>Face found</li>
         <li id="ck-light"><span></span>Lighting</li>
-        <li id="ck-hr"><span></span>Heart rate signal</li>
         <li id="ck-mic"><span></span>Microphone</li>
       </ul>
+      <div class="card howto">
+        <b>How it works</b>
+        <ul>
+          <li>Questions appear one at a time. <b>Tap Yes or No as fast as you can.</b> Saying it out loud helps.</li>
+          <li>When the screen says <b class="lie-text">LIE on purpose</b>, give the wrong answer.</li>
+          <li>Each question comes back a few times in a different order. That's normal.</li>
+        </ul>
+      </div>
       <p id="setup-msg" class="muted"></p>
       <div class="row">
-        <button class="btn primary" id="btn-begin" disabled>Begin questions</button>
+        <button class="btn primary" id="btn-begin" disabled>Begin</button>
         <button class="btn ghost" data-go="home">Cancel</button>
       </div>
     </section>
@@ -88,6 +114,7 @@
         <span><span class="step">Step 3 of 3 · </span><span id="t-progress"></span></span>
         <button class="btn ghost small" id="btn-stop">Stop</button>
       </div>
+      <div class="progress"><span id="t-bar"></span></div>
       <div class="stage">
         <p class="qkind" id="t-kind"></p>
         <p class="qtext" id="t-text"></p>
@@ -105,9 +132,9 @@
       <h1>Results</h1>
       <div id="r-body"></div>
       <div class="row">
-        <button class="btn primary" data-go="setup">Run again</button>
-        <button class="btn" data-go="questions">Edit questions</button>
-        <button class="btn" id="r-csv">Export CSV</button>
+        <button class="btn primary" data-go="setup">Test again</button>
+        <button class="btn" data-go="questions">Change questions</button>
+        <button class="btn ghost" id="r-csv">Download raw data (CSV)</button>
       </div>
     </section>
   </main>
@@ -122,7 +149,6 @@
     <div class="chips">
       <span class="chip"><i id="q-light" class="light"></i><b id="live-q">Signal</b></span>
       <span class="chip">♥ <b id="live-hr">--</b> bpm</span>
-      <span class="chip">Blinks <b id="live-blink">0</b></span>
       <span class="chip mic">Mic <span class="meter"><span id="live-mic"></span></span></span>
     </div>
   </div>

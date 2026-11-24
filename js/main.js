@@ -1,23 +1,26 @@
-import { loadQuestions, saveQuestions, newId, parseImport, DEFAULT_QUESTIONS } from './questions.js';
+import { loadQuestions, saveQuestions, loadSettings, saveSettings, newId, parseImport, DEFAULT_QUESTIONS, TYPES } from './questions.js';
 import { RPPG } from './rppg.js';
 import { Voice } from './voice.js';
-import { computeResults, FEATURES, MIN_BASELINE } from './scoring.js';
+import { computeResults, FEATURES, MIN } from './scoring.js';
 
 const $ = (s, el = document) => el.querySelector(s);
 const SIM = new URLSearchParams(location.search).has('sim'); // ?sim=1 -> fake sensor data, for testing the flow
-const HOLD_SEC = SIM ? 1 : 6;     // "hold still" time after each answer (lets heart rate react)
-const READY_MS = SIM ? 300 : 1500;
-const ANSWER_TIMEOUT_MS = 20000;
+const FIX_MS = SIM ? 150 : 1000;     // "+" before each question
+const AFTER_MS = SIM ? 150 : 2500;   // quiet gap after each answer (blinks / tension window)
+const ANSWER_TIMEOUT_MS = 10000;
+const SEC_PER_ITEM = 6;
+const READ_S_PER_WORD = 0.12;        // reading-time allowance subtracted from answer times
 
 let questions = loadQuestions();
+let settings = loadSettings();
 let editingId = null;
 let lastResults = loadLast();
 
 const S = {
   stream: null, landmarker: null, analyzer: null, vision: null,
   voice: new Voice(), rppg: new RPPG(), frames: [],
-  loopOn: false, uiTimer: null, liveHr: null, micCalibrated: false,
-  abort: false, answerResolve: null, sensorsStarting: null,
+  loopOn: false, loopGen: 0, uiTimer: null, micCalibrated: false,
+  abort: false, answerResolve: null,
 };
 
 /* ---------- small helpers ---------- */
@@ -25,6 +28,7 @@ function h(tag, attrs = {}, ...kids) {
   const el = document.createElement(tag);
   for (const [k, v] of Object.entries(attrs)) {
     if (k === 'class') el.className = v;
+    else if (k === 'style') el.style.cssText = v;
     else if (k.startsWith('on')) el.addEventListener(k.slice(2), v);
     else if (v !== false && v != null) el.setAttribute(k, v === true ? '' : v);
   }
@@ -33,20 +37,24 @@ function h(tag, attrs = {}, ...kids) {
 }
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const mean = (a) => (a.length ? a.reduce((x, y) => x + y, 0) / a.length : null);
-const fmt = (v, dp = 1) => (typeof v === 'number' && Number.isFinite(v) ? v.toFixed(dp) : '–');
 function download(name, text, type) {
   const a = h('a', { href: URL.createObjectURL(new Blob([text], { type })), download: name });
   document.body.append(a); a.click(); a.remove();
 }
-function loadLast() { try { return JSON.parse(localStorage.getItem('ld.lastResults.v1')); } catch { return null; } }
-function saveLast(r) { try { localStorage.setItem('ld.lastResults.v1', JSON.stringify(r)); } catch { /* ignore */ } }
+function shuffle(a) {
+  const b = a.slice();
+  for (let i = b.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [b[i], b[j]] = [b[j], b[i]]; }
+  return b;
+}
+function loadLast() { try { return JSON.parse(localStorage.getItem('ld.lastResults.v2')); } catch { return null; } }
+function saveLast(r) { try { localStorage.setItem('ld.lastResults.v2', JSON.stringify(r)); } catch { /* ignore */ } }
 
 /* ---------- navigation ---------- */
 function show(id) {
   document.querySelectorAll('.screen').forEach((s) => { s.hidden = s.id !== id; });
   const slot = $(`#${id} .sensor-slot`);
   if (slot) slot.append($('#sensor'));
-  if (id === 'home') renderHome();
+  if (id === 'home') $('#btn-last').hidden = !lastResults;
   if (id === 'questions') renderQuestions();
   if (id === 'setup') enterSetup();
   if (id !== 'setup' && id !== 'test') stopSensors();
@@ -56,31 +64,35 @@ document.addEventListener('click', (e) => {
   const go = e.target.closest('[data-go]');
   if (go && !go.disabled) { if (S.answerResolve) stopTest(); show(go.dataset.go); }
 });
-
-/* ---------- home ---------- */
-function counts() {
-  const b = questions.filter((q) => q.type === 'baseline').length;
-  return { b, t: questions.length - b };
-}
-function renderHome() {
-  const { b, t } = counts();
-  $('#home-count').textContent = `${questions.length} questions: ${b} baseline, ${t} test.`;
-  $('#btn-last').hidden = !lastResults;
-}
 $('#btn-last').onclick = () => { renderResults(lastResults); show('results'); };
 
-/* ---------- question manager ---------- */
+/* ---------- question manager (admin) ---------- */
+function counts() {
+  const c = { truth: 0, lie: 0, test: 0 };
+  for (const q of questions) c[q.type]++;
+  return c;
+}
+function setupProblems() {
+  const c = counts(), p = [];
+  if (c.truth < MIN.truth) p.push(`${MIN.truth - c.truth} more truth practice`);
+  if (c.lie < MIN.lie) p.push(`${MIN.lie - c.lie} more lie practice`);
+  if (c.test < MIN.test) p.push('at least 1 test question');
+  return p;
+}
 function renderQuestions() {
-  const { b, t } = counts();
-  $('#q-counts').textContent = `${b} baseline · ${t} test` + (b < MIN_BASELINE ? `  (add ${MIN_BASELINE - b} more baseline)` : '') + (t < 1 ? '  (add at least 1 test question)' : '');
-  $('#btn-ready').disabled = b < MIN_BASELINE || t < 1;
+  const c = counts();
+  const probs = setupProblems();
+  $('#q-counts').textContent = `${c.truth} truth · ${c.lie} lie · ${c.test} test` + (probs.length ? `  (add ${probs.join(', ')})` : '');
+  $('#btn-ready').disabled = probs.length > 0;
+  $('#rounds').value = String(settings.rounds);
+  const mins = Math.ceil((questions.length * settings.rounds * SEC_PER_ITEM) / 60);
+  $('#duration').textContent = `≈ ${mins} min test`;
+
   const ul = $('#qlist');
   ul.replaceChildren(...questions.map((q, i) => {
     if (q.id === editingId) {
       const ta = h('textarea', { rows: 2, maxlength: 200 }); ta.value = q.text;
-      const sel = h('select', {},
-        h('option', { value: 'test', selected: q.type === 'test' }, 'Test question'),
-        h('option', { value: 'baseline', selected: q.type === 'baseline' }, 'Baseline (answer truthfully)'));
+      const sel = h('select', {}, ...Object.entries(TYPES).map(([k, t]) => h('option', { value: k, selected: q.type === k }, t.label)));
       return h('li', {}, h('div', { class: 'edit' }, ta, h('div', { class: 'row' }, sel,
         h('button', { class: 'btn primary small', onclick: () => {
           if (!ta.value.trim()) return;
@@ -89,7 +101,7 @@ function renderQuestions() {
         h('button', { class: 'btn ghost small', onclick: () => { editingId = null; renderQuestions(); } }, 'Cancel'))));
     }
     return h('li', {},
-      h('span', { class: `badge ${q.type}` }, q.type),
+      h('span', { class: `badge ${q.type}` }, TYPES[q.type].badge),
       h('span', { class: 'qt' }, q.text),
       h('span', { class: 'acts' },
         h('button', { class: 'btn ghost icon', title: 'Move up', 'aria-label': 'Move up', disabled: i === 0, onclick: () => move(i, -1) }, '↑'),
@@ -107,6 +119,7 @@ function move(i, d) {
 }
 function commit() { saveQuestions(questions); renderQuestions(); }
 
+$('#rounds').onchange = (e) => { settings.rounds = Number(e.target.value); saveSettings(settings); renderQuestions(); };
 $('#qform').addEventListener('submit', (e) => {
   e.preventDefault();
   const text = $('#qtext').value.trim();
@@ -135,10 +148,9 @@ $('#q-reset').onclick = () => {
 
 /* ---------- sensors ---------- */
 async function startSensors() {
-  if (SIM) return;
-  if (S.stream) return;
+  if (SIM || S.stream) return;
   if (!navigator.mediaDevices?.getUserMedia) {
-    throw new Error('This browser can only use the camera on a secure page. Open the app at http://localhost or an https:// address.');
+    throw new Error('This browser can only use the camera on a secure page (https:// or localhost).');
   }
   const video = $('#video');
   const vc = { facingMode: 'user', width: { ideal: 640 }, height: { ideal: 480 }, frameRate: { ideal: 30 } };
@@ -148,7 +160,7 @@ async function startSensors() {
       video: vc, audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false },
     });
   } catch (err) {
-    if (err.name === 'NotAllowedError' || err.name === 'NotFoundError' || err.name === 'OverconstrainedError') {
+    if (['NotAllowedError', 'NotFoundError', 'OverconstrainedError', 'NotReadableError'].includes(err.name)) {
       S.stream = await navigator.mediaDevices.getUserMedia({ video: vc });
       hasMic = false;
     } else throw err;
@@ -174,7 +186,7 @@ async function startSensors() {
   S.rppg.reset();
   S.frames = [];
   S.loopOn = true;
-  const gen = (S.loopGen = (S.loopGen || 0) + 1);
+  const gen = ++S.loopGen;
   frameLoop(gen);
   setMsg('');
 }
@@ -189,7 +201,7 @@ function frameLoop(gen) {
       fr.t = now;
       S.frames.push(fr);
       if (fr.face) S.rppg.push(now, ...fr.rgb);
-      while (S.frames.length && S.frames[0].t < now - 90000) S.frames.shift();
+      while (S.frames.length && S.frames[0].t < now - 120000) S.frames.shift();
     }
   } catch (err) { console.error(err); }
   if (video.requestVideoFrameCallback) video.requestVideoFrameCallback(() => frameLoop(gen));
@@ -203,89 +215,69 @@ function stopSensors() {
   S.micCalibrated = false;
   S.stream?.getTracks().forEach((t) => t.stop());
   S.stream = null;
-  const video = $('#video');
-  video.srcObject = null;
+  $('#video').srcObject = null;
   setVidMsg(SIM ? 'Simulation mode: no camera' : 'Camera off');
   const o = $('#overlay'); o.getContext('2d').clearRect(0, 0, o.width, o.height);
 }
 
 function liveStatus() {
-  if (SIM) return { face: 1, bright: 140, hr: { bpm: 74 + Math.random() * 3, quality: 0.8 }, blinks: 0 };
+  if (SIM) return { face: 1, bright: 140, hr: { bpm: 74 + Math.random() * 3, quality: 0.8 } };
   const now = performance.now();
   const recent = S.frames.filter((f) => f.t > now - 1000);
   const faces = recent.filter((f) => f.face);
-  const face = recent.length ? faces.length / recent.length : 0;
-  const bright = mean(faces.map((f) => f.brightness));
-  const hr = S.rppg.estimate(now, 10);
-  let blinks = 0, prev = false;
-  for (const f of S.frames) if (f.face && f.t > now - 60000) { const b = f.blink > 0.45; if (b && !prev) blinks++; prev = b; }
-  return { face, bright, hr, blinks };
+  return {
+    face: recent.length ? faces.length / recent.length : 0,
+    bright: mean(faces.map((f) => f.brightness)),
+    hr: S.rppg.estimate(now, 10),
+  };
 }
 
 function updateLive() {
   const st = liveStatus();
-  S.liveHr = st.hr;
-  $('#live-hr').textContent = st.hr && st.hr.quality > 0.2 ? Math.round(st.hr.bpm) : '--';
-  $('#live-blink').textContent = st.blinks;
+  $('#live-hr').textContent = st.hr && st.hr.quality > 0.3 ? Math.round(st.hr.bpm) : '--';
   $('#live-mic').style.width = `${Math.min(100, (S.voice.level / (S.voice.threshold * 3)) * 100)}%`;
-  const q = 0.6 * st.face + 0.4 * (st.hr?.quality || 0);
   const light = $('#q-light');
-  light.className = `light ${q > 0.75 ? 'good' : q > 0.45 ? 'fair' : 'poor'}`;
-  $('#live-q').textContent = q > 0.75 ? 'Good signal' : q > 0.45 ? 'Fair signal' : 'Poor signal';
+  const okLight = st.bright != null && st.bright >= 60 && st.bright <= 225;
+  const q = st.face > 0.8 && okLight ? 'good' : st.face > 0.5 ? 'fair' : 'poor';
+  light.className = `light ${q}`;
+  $('#live-q').textContent = q === 'good' ? 'Good view' : q === 'fair' ? 'Face partly lost' : 'Face not found';
 
   if (!$('#setup').hidden) {
     setCheck('ck-face', st.face > 0.7 ? 'ok' : st.face > 0.3 ? 'mid' : 'bad');
     const b = st.bright;
     setCheck('ck-light', b == null ? '' : b < 60 || b > 225 ? 'bad' : b < 85 || b > 205 ? 'mid' : 'ok',
       b == null ? 'Lighting' : b < 60 ? 'Lighting: too dark' : b > 225 ? 'Lighting: too bright' : 'Lighting');
-    const hq = st.hr?.quality || 0;
-    setCheck('ck-hr', hq > 0.45 ? 'ok' : hq > 0.2 ? 'mid' : 'bad', hq > 0.45 ? 'Heart rate signal' : 'Heart rate: hold still…');
-    setCheck('ck-mic', SIM || S.micCalibrated ? 'ok' : S.voice.ready ? 'mid' : 'bad', SIM || S.voice.ready ? 'Microphone' : 'Microphone: off');
+    setCheck('ck-mic', SIM || S.micCalibrated ? 'ok' : S.voice.ready ? 'mid' : 'bad', SIM || S.voice.ready ? 'Microphone' : 'Microphone: off (optional)');
     $('#btn-begin').disabled = !(SIM || st.face > 0.7);
-    if (!SIM && st.face > 0.7 && hq <= 0.45 && !$('#setup-msg').dataset.busy) {
-      setMsg('Heart rate needs ~10 s of stillness to lock on. You can start anyway; it will just count for less.');
-    }
   }
 }
 
-function setVidMsg(t) {
-  const el = $('#vid-empty');
-  el.textContent = t;
-  el.hidden = false;
-}
-
+function setVidMsg(t) { const el = $('#vid-empty'); el.textContent = t; el.hidden = false; }
 function setCheck(id, cls, label) {
   const li = $(`#${id}`);
   li.className = cls;
   if (label) li.lastChild.textContent = label;
 }
-function setMsg(t) {
-  const m = $('#setup-msg');
-  m.textContent = t;
-  m.dataset.busy = t && t.endsWith('…') ? '1' : '';
-}
+function setMsg(t) { $('#setup-msg').textContent = t; }
 
 async function enterSetup() {
   $('#btn-begin').disabled = true;
-  ['ck-cam', 'ck-face', 'ck-light', 'ck-hr', 'ck-mic'].forEach((id) => setCheck(id, ''));
-  if (counts().b < MIN_BASELINE) {
-    setMsg(`You need at least ${MIN_BASELINE} baseline questions. Add more in "Edit questions".`);
-    return;
-  }
-  if (SIM) setMsg('Simulation mode: no camera or mic is used, sensor data is made up.');
+  ['ck-cam', 'ck-face', 'ck-light', 'ck-mic'].forEach((id) => setCheck(id, ''));
+  const probs = setupProblems();
+  if (probs.length) { setMsg(`The admin needs to add ${probs.join(', ')} first.`); return; }
+  setMsg(SIM ? 'Simulation mode: no camera or mic is used, sensor data is made up.' : '');
   clearInterval(S.uiTimer);
   S.uiTimer = setInterval(updateLive, 500);
   try {
-    S.sensorsStarting = startSensors();
-    await S.sensorsStarting;
-    if (SIM) ['ck-cam', 'ck-face', 'ck-light', 'ck-hr', 'ck-mic'].forEach((id) => setCheck(id, 'ok'));
+    await startSensors();
+    if (SIM) ['ck-cam', 'ck-face', 'ck-light', 'ck-mic'].forEach((id) => setCheck(id, 'ok'));
   } catch (err) {
     console.error(err);
     setCheck('ck-cam', 'bad');
     const blocked = err.name === 'NotAllowedError';
     setVidMsg(blocked ? 'Camera blocked' : 'Camera not available');
     setMsg(blocked
-      ? 'Camera permission was blocked. Click the camera icon in the address bar, allow camera and microphone, then reload. (The Claude app\'s built-in browser can\'t use the camera: open this page in Chrome or Edge.)'
+      ? 'Camera permission was blocked. Allow camera (and microphone) for this page in the browser settings, then reload. The Claude app\'s built-in browser can\'t use the camera.'
       : `Could not start sensors: ${err.message}`);
   }
 }
@@ -303,10 +295,7 @@ document.addEventListener('keydown', (e) => {
   if (e.key === 'n' || e.key === 'N') S.answerResolve('no');
 });
 
-function stopTest() {
-  S.abort = true;
-  S.answerResolve?.('none');
-}
+function stopTest() { S.abort = true; S.answerResolve?.('none'); }
 
 function waitAnswer(ms) {
   return new Promise((resolve) => {
@@ -316,8 +305,10 @@ function waitAnswer(ms) {
   });
 }
 
-function setStage({ kind = '', text = '', hint = '', big = false, answers = false }) {
-  $('#t-kind').textContent = kind;
+function setStage({ kind = '', kindClass = '', text = '', hint = '', big = false, answers = false }) {
+  const k = $('#t-kind');
+  k.textContent = kind;
+  k.className = `qkind ${kindClass}`;
   const t = $('#t-text');
   t.textContent = text;
   t.classList.toggle('big', big);
@@ -325,210 +316,154 @@ function setStage({ kind = '', text = '', hint = '', big = false, answers = fals
   $('#t-answers').style.visibility = answers ? 'visible' : 'hidden';
 }
 
+const KIND = {
+  truth: { kind: 'Practice · tell the truth', cls: 'k-truth' },
+  lie: { kind: 'Practice · LIE on purpose', cls: 'k-lie' },
+  test: { kind: 'Question', cls: '' },
+};
+
+async function askOne(q) {
+  setStage({ text: '+', big: true });
+  await sleep(FIX_MS);
+  if (S.abort) return null;
+  const t0 = performance.now();
+  setStage({ kind: KIND[q.type].kind, kindClass: KIND[q.type].cls, text: q.text, hint: 'Tap as fast as you can', answers: true });
+  const answer = await waitAnswer(ANSWER_TIMEOUT_MS);
+  if (S.abort) return null;
+  const tAns = performance.now();
+  setStage({ text: '', big: true });
+  await sleep(AFTER_MS);
+  if (S.abort) return null;
+  return { answer, t0, tAns, t1: performance.now() };
+}
+
 async function runTest() {
-  const list = questions.slice();
+  const rounds = settings.rounds;
+  const plan = [];
+  for (let r = 0; r < rounds; r++) for (const q of shuffle(questions)) plan.push({ q, round: r + 1 });
   S.abort = false;
   show('test');
-  const records = [];
-  for (let i = 0; i < list.length; i++) {
-    if (S.abort) return;
-    const q = list[i];
-    $('#t-progress').textContent = `Question ${i + 1} of ${list.length}`;
-    setStage({ kind: 'Get ready', text: '+', big: true });
-    await sleep(READY_MS);
-    if (S.abort) return;
 
-    const t0 = performance.now();
-    setStage({
-      kind: q.type === 'baseline' ? 'Baseline · answer truthfully' : 'Question',
-      text: q.text,
-      hint: 'Say your answer out loud, then tap it (or press Y / N).',
-      answers: true,
-    });
-    const answer = await waitAnswer(ANSWER_TIMEOUT_MS);
-    if (S.abort) return;
-    const tAns = performance.now();
+  // Unscored warm-up (first answers are always exaggerated)
+  $('#t-progress').textContent = 'Warm-up';
+  $('#t-bar').style.width = '0%';
+  const warm = await askOne({ type: 'test', text: 'Ready? Tap Yes to begin.' });
+  if (!warm) return;
 
-    for (let s = HOLD_SEC; s > 0; s--) {
-      setStage({ kind: 'Hold still', text: String(s), big: true, hint: 'Keep looking at the screen and breathe normally.' });
-      await sleep(1000);
-      if (S.abort) return;
-    }
-    const t1 = performance.now();
-    records.push({
-      id: q.id, type: q.type, text: q.text, answer,
-      features: SIM ? simFeatures(q, tAns - t0) : extract(q, t0, tAns, t1),
+  const answers = [];
+  for (let i = 0; i < plan.length; i++) {
+    const { q, round } = plan[i];
+    $('#t-progress').textContent = `${i + 1} of ${plan.length}`;
+    $('#t-bar').style.width = `${(i / plan.length) * 100}%`;
+    const r = await askOne(q);
+    if (!r) return;
+    const features = SIM ? simFeatures(q) : extract(q, r);
+    answers.push({
+      id: q.id, type: q.type, text: q.text, round, answer: r.answer, features,
+      valid: r.answer !== 'none' && features.faceFrac >= 0.6,
     });
   }
-  const res = computeResults(records);
+  const res = computeResults(answers, rounds);
   res.sim = SIM;
   res.date = new Date().toISOString();
+  res.raw = answers.map(({ id, type, text, round, answer, valid, S: score, features }) => ({ id, type, text, round, answer, valid, score, features }));
   lastResults = res;
   saveLast(res);
   renderResults(res);
   show('results');
 }
 
-// Per-question measurements from the sensor logs
-function extract(q, t0, tAns, t1) {
+// Per-answer measurements from the sensor logs
+function extract(q, { t0, tAns, t1 }) {
   const fr = S.frames.filter((f) => f.t >= t0 && f.t <= t1);
   const faces = fr.filter((f) => f.face);
   const dur = (t1 - t0) / 1000;
-  const faceFrac = fr.length ? faces.length / fr.length : 0;
-  const readAdj = 0.15 * q.text.split(/\s+/).length; // longer questions take longer to read
-
+  const readAdj = READ_S_PER_WORD * q.text.split(/\s+/).length;
   let blinks = 0, prev = false;
   for (const f of faces) { const b = f.blink > 0.45; if (b && !prev) blinks++; prev = b; }
-
-  let gaze = 0;
-  for (let i = 1; i < faces.length; i++) gaze += Math.abs(faces[i].gazeX - faces[i - 1].gazeX) + Math.abs(faces[i].gazeY - faces[i - 1].gazeY);
-
-  let headMotion = null;
-  if (faces.length > 10) {
-    const fw = mean(faces.map((f) => f.faceW)) || 1;
-    const mx = mean(faces.map((f) => f.noseX)), my = mean(faces.map((f) => f.noseY));
-    headMotion = Math.sqrt(mean(faces.map((f) => ((f.noseX - mx) ** 2 + (f.noseY - my) ** 2) / fw ** 2)));
-  }
-
-  const hr = S.rppg.estimate(t1, 10);
+  const enough = faces.length >= 8;
   const v = S.voice.ready ? S.voice.window(t0, tAns + 1500) : null;
-  const enough = faces.length > 10;
-  const hrQuality = hr?.quality || 0;
-  const voiceLatency = v?.onset != null ? v.onset - readAdj : null;
-
   return {
     responseTime: tAns - t0 < ANSWER_TIMEOUT_MS - 50 ? (tAns - t0) / 1000 - readAdj : null,
-    voiceLatency,
+    voiceLatency: v?.onset != null && v.onset < (tAns - t0) / 1000 + 1 ? v.onset - readAdj : null,
     pitch: v?.pitchMean ?? null,
-    hr: hr?.bpm ?? null,
-    rmssd: hr?.rmssd ?? null,
-    hrQuality,
-    tension: enough ? mean(faces.map((f) => f.tension)) : null,
     blinkRate: enough ? blinks / (dur / 60) : null,
-    gazeMove: enough ? gaze / dur : null,
-    headMotion,
-    faceFrac,
-    quality: 0.5 * faceFrac + 0.35 * hrQuality + 0.15 * (voiceLatency != null ? 1 : 0),
+    tension: enough ? mean(faces.map((f) => f.tension)) : null,
+    faceFrac: fr.length ? faces.length / fr.length : 0,
   };
 }
 
-// Fake data for ?sim=1: test questions are randomly "lies" with raised stress signals
-function simFeatures(q, rtMs) {
+// Fake data for ?sim=1. Each test question is randomly a "lie" for the whole session.
+const simTruth = new Map();
+function simFeatures(q) {
   const g = () => { let s = 0; for (let i = 0; i < 6; i++) s += Math.random(); return (s - 3) / Math.sqrt(0.5); };
-  const lie = q.type === 'test' && Math.random() < 0.5;
-  const k = lie ? 1.6 : 0;
+  if (q.type === 'test' && !simTruth.has(q.id)) simTruth.set(q.id, Math.random() < 0.5);
+  const lie = q.type === 'lie' || (q.type === 'test' && simTruth.get(q.id));
+  const k = lie ? 1 : 0;
   return {
-    responseTime: 1.2 + 0.3 * g() + 0.5 * k,
-    voiceLatency: 0.9 + 0.25 * g() + 0.4 * k,
-    pitch: 150 + 8 * g() + 10 * k,
-    hr: 75 + 3 * g() + 5 * k,
-    rmssd: 40 + 8 * g() - 8 * k,
-    hrQuality: 0.8,
-    tension: 0.12 + 0.03 * g() + 0.04 * k,
-    blinkRate: 18 + 5 * g() + 4 * k,
-    gazeMove: 0.6 + 0.1 * g() + 0.1 * k,
-    headMotion: 0.02 + 0.005 * g() + 0.006 * k,
+    responseTime: 0.9 + 0.18 * g() + 0.3 * k,
+    voiceLatency: 0.8 + 0.2 * g() + 0.2 * k,
+    pitch: 150 + 8 * g() + 4 * k,
+    blinkRate: 18 + 5 * g() - 3 * k,
+    tension: 0.12 + 0.03 * g() + 0.015 * k,
     faceFrac: 1,
-    quality: 0.85,
-    simLie: lie,
+    simLie: q.type === 'test' ? lie : undefined,
   };
 }
 
-/* ---------- results ---------- */
+/* ---------- results (simple) ---------- */
+const VERDICT = {
+  truth: { label: 'Likely truth', cls: 'truth' },
+  lie: { label: 'Likely lie', cls: 'lie' },
+  unsure: { label: "Can't tell", cls: 'unsure' },
+};
+
 function renderResults(res) {
   const body = $('#r-body');
   body.replaceChildren();
-  if (!res) return;
-  if (res.error) {
-    body.append(h('div', { class: 'warn' }, res.error));
-    return;
-  }
-  const tests = res.items.filter((r) => r.type === 'test');
-  const nLie = tests.filter((r) => r.verdict === 'lie').length;
-  const nTruth = tests.filter((r) => r.verdict === 'truth').length;
+  if (!res?.calibration) return;
+  if (res.sim) body.append(h('p', { class: 'sim' }, 'Simulated data. No real sensors were used.'));
 
-  if (res.sim) body.append(h('p', { class: 'sim' }, 'Simulated data (?sim=1). No real sensors were used.'));
-  body.append(
-    h('div', { class: 'summary' },
-      stat(fmt(res.baseMean, 2), 'Baseline stress score'),
-      stat(fmt(res.threshold, 2), 'Lie threshold'),
-      stat(String(nTruth), 'Marked Truth'),
-      stat(String(nLie), 'Marked Lie')),
-    h('p', { class: 'muted small' }, 'Stress score 0 ≈ your baseline average. Above the threshold (baseline + 1 normal spread) = Lie, below = Truth. Confidence drops when the answer is close to the threshold or the signal was poor.'),
-    h('div', { class: 'card chart' }, chart(res)),
-    h('h2', {}, 'Test questions'),
-    ...tests.map((r) => resultCard(r, res)),
-    h('details', { class: 'card' },
-      h('summary', {}, `Baseline questions (${res.items.length - tests.length})`),
-      ...res.items.filter((r) => r.type === 'baseline').map((r) =>
-        h('p', { class: 'meta' }, `${r.text} · answered ${r.answer} · score ${fmt(r.score, 2)}`))),
-    h('div', { class: 'warn small' }, 'Experimental. These signals measure stress and effort, not honesty. Do not use the verdicts to judge or make decisions about anyone.'),
-  );
-}
-function stat(v, label) { return h('div', { class: 'stat' }, h('b', {}, v), h('span', {}, label)); }
+  const c = res.calibration;
+  const calTitle = { good: 'Practice check: good', weak: 'Practice check: weak', failed: "Practice check: didn't work" }[c.status];
+  const calText = c.status === 'failed'
+    ? `${c.reason} Every answer below is "Can't tell". Try again with the phone on a stand, good light, and answering as fast as possible.`
+    : `On the practice questions, the app told this person's truths from their lies ${c.correct} out of ${c.total} times.` +
+      (c.status === 'weak' ? ' That is only a little better than guessing, so treat the results below with extra caution.' : '');
+  body.append(h('div', { class: `cal ${c.status}` }, h('b', {}, calTitle), h('p', {}, calText)));
 
-function resultCard(r, res) {
-  const q = r.features.quality ?? 0;
-  const qLabel = q > 0.75 ? 'good' : q > 0.45 ? 'fair' : 'poor';
-  const verdictText = r.verdict === 'lie' ? 'LIE' : r.verdict === 'truth' ? 'TRUTH' : 'NO DATA';
-  return h('div', { class: `result ${r.verdict}` },
-    h('div', { class: 'head' },
-      h('div', { class: 'qq' }, r.text),
-      h('span', { class: `pill ${r.verdict}` }, r.confidence != null ? `${verdictText} · ${r.confidence}%` : verdictText)),
-    h('div', { class: 'meta' },
-      `Answered: ${r.answer === 'none' ? 'no answer' : r.answer} · stress score ${fmt(r.score, 2)} (threshold ${fmt(res.threshold, 2)}) · signal ${qLabel}` +
-      (r.features.simLie != null ? ` · sim was ${r.features.simLie ? 'a lie' : 'true'}` : '')),
-    r.contribs?.length ? h('details', {},
-      h('summary', {}, 'What drove this'),
-      h('table', {},
-        h('tr', {}, h('th', {}, 'Signal'), h('th', {}, 'This answer'), h('th', {}, 'Baseline'), h('th', {}, 'vs normal')),
-        ...r.contribs.slice(0, 6).map((c) => h('tr', {},
-          h('td', {}, c.label),
-          h('td', {}, `${fmt(c.value, c.dp)} ${c.unit}`),
-          h('td', {}, `${fmt(c.baseline, c.dp)} ${c.unit}`),
-          h('td', { class: c.z > 0.5 ? 'up' : c.z < -0.5 ? 'down' : '' }, `${c.z >= 0 ? '+' : ''}${c.z.toFixed(1)}× ${c.z >= 0 ? 'more stress' : 'calmer'}`))))) : null);
+  body.append(h('h2', {}, 'Test questions'));
+  for (const q of res.questions) body.append(resultRow(q));
+
+  body.append(h('p', { class: 'muted small explain' },
+    'Each question was asked ', String(res.rounds), ' times. "Likely" means about 3 in 4 or more by this app\'s estimate; anything in between is "Can\'t tell". ',
+    'It mostly measures answer speed and tension, not honesty. Even professional polygraphs are wrong about 1 time in 7, and phone tests are usually wrong more often.'));
 }
 
-function chart(res) {
-  const NS = 'http://www.w3.org/2000/svg';
-  const items = res.items.filter((r) => typeof r.score === 'number');
-  const W = 600, rowH = 26, top = 24, left = 34, right = 16;
-  const Hh = top + items.length * rowH + 8;
-  const lim = Math.max(2, ...items.map((r) => Math.abs(r.score)), Math.abs(res.threshold) + 0.5);
-  const x = (v) => left + ((v + lim) / (2 * lim)) * (W - left - right);
-  const svg = document.createElementNS(NS, 'svg');
-  svg.setAttribute('viewBox', `0 0 ${W} ${Hh}`);
-  svg.setAttribute('role', 'img');
-  svg.setAttribute('aria-label', 'Stress score per question compared with the lie threshold');
-  const el = (tag, a, text) => {
-    const e = document.createElementNS(NS, tag);
-    for (const [k, v] of Object.entries(a)) e.setAttribute(k, v);
-    if (text != null) e.textContent = text;
-    svg.append(e);
-    return e;
-  };
-  const css = getComputedStyle(document.documentElement);
-  const c = (n) => css.getPropertyValue(n).trim();
-  el('line', { x1: x(0), x2: x(0), y1: top - 6, y2: Hh, stroke: c('--line') });
-  el('text', { x: x(0), y: 12, fill: c('--muted'), 'font-size': 11, 'text-anchor': 'middle' }, 'baseline');
-  items.forEach((r, i) => {
-    const y = top + i * rowH;
-    const col = r.verdict === 'lie' ? c('--lie') : r.verdict === 'truth' ? c('--truth') : c('--muted');
-    const x0 = Math.min(x(0), x(r.score)), w = Math.max(2, Math.abs(x(r.score) - x(0)));
-    el('text', { x: 4, y: y + 16, fill: c('--muted'), 'font-size': 12 }, String(res.items.indexOf(r) + 1));
-    el('rect', { x: x0, y: y + 5, width: w, height: rowH - 10, rx: 3, fill: col, opacity: r.type === 'baseline' ? 0.45 : 0.9 });
-  });
-  el('line', { x1: x(res.threshold), x2: x(res.threshold), y1: top - 6, y2: Hh, stroke: c('--lie'), 'stroke-dasharray': '4 4' });
-  el('text', { x: x(res.threshold) + 4, y: 12, fill: c('--lie'), 'font-size': 11 }, 'lie threshold');
-  return svg;
+function resultRow(q) {
+  const v = VERDICT[q.verdict];
+  const odds = q.p == null ? q.why
+    : q.p < 0.5 ? `About ${Math.floor((1 - q.p) * 10 + 1e-9)} in 10 chance it was true`
+    : `About ${Math.floor(q.p * 10 + 1e-9)} in 10 chance it was a lie`;
+  return h('div', { class: `res ${v.cls}` },
+    h('div', { class: 'res-head' },
+      h('div', { class: 'res-q' }, q.text),
+      h('span', { class: `pill ${v.cls}` }, v.label)),
+    h('div', { class: 'meter3', role: 'img', 'aria-label': `${v.label}. ${odds}` },
+      h('span', { class: 'z truth' }, 'Truth'), h('span', { class: 'z unsure' }, "Can't tell"), h('span', { class: 'z lie' }, 'Lie'),
+      q.p != null ? h('i', { class: 'marker', style: `left:${(q.p * 100).toFixed(1)}%` }) : null),
+    h('p', { class: 'res-odds' }, odds),
+    h('p', { class: 'res-meta' }, `Answered ${q.answer}` + (q.reasons?.length ? ` · ${q.reasons.join(' · ')}` : '') +
+      (q.simLie != null ? ` · (simulated as ${q.simLie ? 'a lie' : 'true'})` : '')));
 }
 
 $('#r-csv').onclick = () => {
-  if (!lastResults?.items) return;
-  const cols = ['n', 'type', 'question', 'answer', 'verdict', 'confidence', 'score', 'quality', ...FEATURES.map((f) => f.key), 'hrQuality'];
+  if (!lastResults?.raw) return;
+  const keys = FEATURES.map((f) => f.key);
+  const cols = ['n', 'round', 'type', 'question', 'answer', 'valid', 'lieScore', ...keys, 'faceFrac'];
   const esc = (v) => `"${String(v ?? '').replace(/"/g, '""')}"`;
-  const rows = lastResults.items.map((r, i) => [i + 1, r.type, r.text, r.answer, r.verdict, r.confidence ?? '', r.score ?? '', r.features.quality ?? '',
-    ...FEATURES.map((f) => r.features[f.key] ?? ''), r.features.hrQuality ?? ''].map(esc).join(','));
+  const rows = lastResults.raw.map((r, i) => [i + 1, r.round, r.type, r.text, r.answer, r.valid, r.score ?? '',
+    ...keys.map((k) => r.features[k] ?? ''), r.features.faceFrac ?? ''].map(esc).join(','));
   download('truth-meter-results.csv', [cols.join(','), ...rows].join('\n'), 'text/csv');
 };
 
