@@ -1,0 +1,132 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Truth Meter</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header class="top">
+    <button class="brand" data-go="home" aria-label="Home"><span class="dot"></span>Truth Meter <small>prototype</small></button>
+  </header>
+
+  <div id="sim-banner" class="sim-banner" hidden>SIMULATION MODE: no camera or mic, sensor data is made up. <a href="./">Switch to real sensors</a></div>
+  <main>
+    <!-- HOME -->
+    <section id="home" class="screen">
+      <h1>Camera + mic stress test</h1>
+      <p class="lead">Answers a list of questions while the camera and microphone track heart rate, eyes, face tension and voice timing. Your truthful <b>baseline</b> answers set your normal level. Each <b>test</b> answer is marked <b>Truth</b> if it stays below that level and <b>Lie</b> if it rises above it, with a confidence score.</p>
+      <div class="warn">
+        <b>Experimental, not a real lie detector.</b> It measures stress and effort, which nerves, lighting and movement also change. Use it only with people who agree to it, and never to make real decisions about anyone.
+      </div>
+      <p class="muted" id="home-count"></p>
+      <div class="row">
+        <button class="btn primary" data-go="questions">Start: set up the questions</button>
+        <button class="btn ghost" id="btn-last" hidden>Last results</button>
+      </div>
+      <p class="muted small">Video and audio are processed in this browser only. Nothing is recorded or uploaded.</p>
+    </section>
+
+    <!-- QUESTIONS -->
+    <section id="questions" class="screen" hidden>
+      <p class="step">Step 1 of 3 · Admin</p>
+      <h1>Set the questions</h1>
+      <p class="muted">The admin sets the questions <b>before</b> the person sits down. They run in this order. <b>Baseline</b> questions must be answered truthfully (they teach the app the person's normal level, at least 3 needed). Mixing them in between test questions works best.</p>
+      <p class="counts" id="q-counts"></p>
+      <ol id="qlist" class="qlist"></ol>
+
+      <form id="qform" class="card addq">
+        <h2>Add a question</h2>
+        <textarea id="qtext" rows="2" maxlength="200" placeholder="e.g. Did you finish the last slice of pizza?" required></textarea>
+        <div class="row">
+          <select id="qtype" aria-label="Question type">
+            <option value="test">Test question</option>
+            <option value="baseline">Baseline (answer truthfully)</option>
+          </select>
+          <button class="btn primary" type="submit">Add question</button>
+        </div>
+      </form>
+
+      <div class="row">
+        <button class="btn" id="q-export">Export list</button>
+        <label class="btn">Import list<input type="file" id="q-import" accept="application/json,.json" hidden></label>
+        <button class="btn ghost" id="q-reset">Reset to examples</button>
+      </div>
+      <div class="card handover">
+        <b>Questions ready?</b> Next, the person being tested sits in front of the camera.
+        <div class="row">
+          <button class="btn primary" id="btn-ready" data-go="setup">Questions ready → sensor check</button>
+          <button class="btn ghost" data-go="home">Back</button>
+        </div>
+      </div>
+    </section>
+
+    <!-- SETUP -->
+    <section id="setup" class="screen" hidden>
+      <p class="step">Step 2 of 3 · Person being tested</p>
+      <h1>Sensor check</h1>
+      <p class="muted">Sit still, face the camera, light in front of you (not behind). Stay quiet for a moment while the mic measures room noise.</p>
+      <div class="sensor-slot"></div>
+      <ul class="checks">
+        <li id="ck-cam"><span></span>Camera</li>
+        <li id="ck-face"><span></span>Face found</li>
+        <li id="ck-light"><span></span>Lighting</li>
+        <li id="ck-hr"><span></span>Heart rate signal</li>
+        <li id="ck-mic"><span></span>Microphone</li>
+      </ul>
+      <p id="setup-msg" class="muted"></p>
+      <div class="row">
+        <button class="btn primary" id="btn-begin" disabled>Begin questions</button>
+        <button class="btn ghost" data-go="home">Cancel</button>
+      </div>
+    </section>
+
+    <!-- TEST -->
+    <section id="test" class="screen" hidden>
+      <div class="testbar">
+        <span><span class="step">Step 3 of 3 · </span><span id="t-progress"></span></span>
+        <button class="btn ghost small" id="btn-stop">Stop</button>
+      </div>
+      <div class="stage">
+        <p class="qkind" id="t-kind"></p>
+        <p class="qtext" id="t-text"></p>
+        <p class="hint" id="t-hint"></p>
+        <div class="row answers" id="t-answers">
+          <button class="btn yes" data-ans="yes">Yes</button>
+          <button class="btn no" data-ans="no">No</button>
+        </div>
+      </div>
+      <div class="sensor-slot small"></div>
+    </section>
+
+    <!-- RESULTS -->
+    <section id="results" class="screen" hidden>
+      <h1>Results</h1>
+      <div id="r-body"></div>
+      <div class="row">
+        <button class="btn primary" data-go="setup">Run again</button>
+        <button class="btn" data-go="questions">Edit questions</button>
+        <button class="btn" id="r-csv">Export CSV</button>
+      </div>
+    </section>
+  </main>
+
+  <!-- Live sensor panel (moved between setup and test screens) -->
+  <div id="sensor" class="sensor">
+    <div class="vid">
+      <video id="video" playsinline muted></video>
+      <canvas id="overlay"></canvas>
+      <div class="vid-empty" id="vid-empty">Camera off</div>
+    </div>
+    <div class="chips">
+      <span class="chip"><i id="q-light" class="light"></i><b id="live-q">Signal</b></span>
+      <span class="chip">♥ <b id="live-hr">--</b> bpm</span>
+      <span class="chip">Blinks <b id="live-blink">0</b></span>
+      <span class="chip mic">Mic <span class="meter"><span id="live-mic"></span></span></span>
+    </div>
+  </div>
+
+  <script type="module" src="js/main.js"></script>
+</body>
+</html>
